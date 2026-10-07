@@ -147,6 +147,19 @@ namespace triton {
         }
       }
 
+      // SMT bit-vector shift/division are TOTAL functions; LLVM's are UB (poison)
+      // at the edges (shift >= width, divide by zero). Lifting them 1:1 makes the
+      // whole function poison the moment the obfuscation feeds an edge value, and
+      // O3 then folds everything to `ret poison`. These helpers reproduce the SMT
+      // semantics so the lifted IR actually computes the transform.
+      auto cst     = [&](llvm::Value* v, uint64_t k) { return llvm::ConstantInt::get(v->getType(), k); };
+      auto zero    = [&](llvm::Value* v) { return cst(v, 0); };
+      auto inRange = [&](llvm::Value* a) {   // shift amount < bit width
+        return this->llvmIR.CreateICmpULT(a, cst(a, a->getType()->getIntegerBitWidth()));
+      };
+      auto nz      = [&](llvm::Value* y) { return this->llvmIR.CreateICmpNE(y, zero(y)); };
+      auto safeDen = [&](llvm::Value* y) { return this->llvmIR.CreateSelect(nz(y), y, cst(y, 1)); };
+
       switch (node->getType()) {
 
         case triton::ast::BSWAP_NODE: {
@@ -169,11 +182,16 @@ namespace triton {
         case triton::ast::BVAND_NODE:
           return this->llvmIR.CreateAnd(children[0], children[1]);
 
-        case triton::ast::BVASHR_NODE:
-          return this->llvmIR.CreateAShr(children[0], children[1]);
+        case triton::ast::BVASHR_NODE: {
+          // amount >= width : SMT fills with the sign bit == ashr by (width-1).
+          auto* amt = this->llvmIR.CreateSelect(inRange(children[1]), children[1],
+                        cst(children[0], children[0]->getType()->getIntegerBitWidth() - 1));
+          return this->llvmIR.CreateAShr(children[0], amt);
+        }
 
-        case triton::ast::BVLSHR_NODE:
-          return this->llvmIR.CreateLShr(children[0], children[1]);
+        case triton::ast::BVLSHR_NODE:   // amount >= width : SMT -> 0
+          return this->llvmIR.CreateSelect(inRange(children[1]),
+                   this->llvmIR.CreateLShr(children[0], children[1]), zero(children[0]));
 
         case triton::ast::BVMUL_NODE:
           return this->llvmIR.CreateMul(children[0], children[1]);
@@ -197,18 +215,24 @@ namespace triton {
         case triton::ast::BVROL_NODE: {
           auto rot  = triton::ast::getInteger<triton::uint64>(node->getChildren()[1]);
           auto size = node->getBitvectorSize();
-          return this->llvmIR.CreateOr(this->llvmIR.CreateShl(children[0], rot % size), this->llvmIR.CreateLShr(children[0], (size - (rot % size))));
+          // (size - rot%size) is `size` when rot%size==0 -> shift-by-width poison; wrap it.
+          return this->llvmIR.CreateOr(this->llvmIR.CreateShl(children[0], rot % size), this->llvmIR.CreateLShr(children[0], (size - (rot % size)) % size));
         }
 
         // bvror(expr, rot) = ((expr >> (rot % size)) | (expr << (size - (rot % size))))
         case triton::ast::BVROR_NODE: {
           auto rot  = triton::ast::getInteger<triton::uint64>(node->getChildren()[1]);
           auto size = node->getBitvectorSize();
-          return this->llvmIR.CreateOr(this->llvmIR.CreateLShr(children[0], rot % size), this->llvmIR.CreateShl(children[0], (size - (rot % size))));
+          return this->llvmIR.CreateOr(this->llvmIR.CreateLShr(children[0], rot % size), this->llvmIR.CreateShl(children[0], (size - (rot % size)) % size));
         }
 
-        case triton::ast::BVSDIV_NODE:
-          return this->llvmIR.CreateSDiv(children[0], children[1]);
+        case triton::ast::BVSDIV_NODE: {
+          // SMT bvsdiv x 0 = (x >= 0 ? -1 : 1); feed a nonzero denom so the div is never UB.
+          auto* z = this->llvmIR.CreateSelect(this->llvmIR.CreateICmpSLT(children[0], zero(children[0])),
+                      cst(children[0], 1), llvm::ConstantInt::getAllOnesValue(children[0]->getType()));
+          return this->llvmIR.CreateSelect(nz(children[1]),
+                   this->llvmIR.CreateSDiv(children[0], safeDen(children[1])), z);
+        }
 
         case triton::ast::BVSGE_NODE:
           return this->llvmIR.CreateICmpSGE(children[0], children[1]);
@@ -216,8 +240,9 @@ namespace triton {
         case triton::ast::BVSGT_NODE:
           return this->llvmIR.CreateICmpSGT(children[0], children[1]);
 
-        case triton::ast::BVSHL_NODE:
-          return this->llvmIR.CreateShl(children[0], children[1]);
+        case triton::ast::BVSHL_NODE:   // amount >= width : SMT -> 0
+          return this->llvmIR.CreateSelect(inRange(children[1]),
+                   this->llvmIR.CreateShl(children[0], children[1]), zero(children[0]));
 
         case triton::ast::BVSLE_NODE:
           return this->llvmIR.CreateICmpSLE(children[0], children[1]);
@@ -227,18 +252,22 @@ namespace triton {
 
         case triton::ast::BVSMOD_NODE: {
           auto* LHS = children[0];
-          auto* RHS = children[1];
-          return this->llvmIR.CreateSRem(this->llvmIR.CreateAdd(this->llvmIR.CreateSRem(LHS, RHS), RHS), RHS);
+          auto* RHS = safeDen(children[1]);   // SMT bvsmod x 0 = x
+          auto* mod = this->llvmIR.CreateSRem(this->llvmIR.CreateAdd(this->llvmIR.CreateSRem(LHS, RHS), RHS), RHS);
+          return this->llvmIR.CreateSelect(nz(children[1]), mod, LHS);
         }
 
-        case triton::ast::BVSREM_NODE:
-          return this->llvmIR.CreateSRem(children[0], children[1]);
+        case triton::ast::BVSREM_NODE:   // SMT x srem 0 = x
+          return this->llvmIR.CreateSelect(nz(children[1]),
+                   this->llvmIR.CreateSRem(children[0], safeDen(children[1])), children[0]);
 
         case triton::ast::BVSUB_NODE:
           return this->llvmIR.CreateSub(children[0], children[1]);
 
-        case triton::ast::BVUDIV_NODE:
-          return this->llvmIR.CreateUDiv(children[0], children[1]);
+        case triton::ast::BVUDIV_NODE:   // SMT x udiv 0 = ~0
+          return this->llvmIR.CreateSelect(nz(children[1]),
+                   this->llvmIR.CreateUDiv(children[0], safeDen(children[1])),
+                   llvm::ConstantInt::getAllOnesValue(children[0]->getType()));
 
         case triton::ast::BVUGE_NODE:
           return this->llvmIR.CreateICmpUGE(children[0], children[1]);
@@ -252,8 +281,9 @@ namespace triton {
         case triton::ast::BVULT_NODE:
           return this->llvmIR.CreateICmpULT(children[0], children[1]);
 
-        case triton::ast::BVUREM_NODE:
-          return this->llvmIR.CreateURem(children[0], children[1]);
+        case triton::ast::BVUREM_NODE:   // SMT x urem 0 = x
+          return this->llvmIR.CreateSelect(nz(children[1]),
+                   this->llvmIR.CreateURem(children[0], safeDen(children[1])), children[0]);
 
         case triton::ast::BVXNOR_NODE:
           return this->llvmIR.CreateNot(this->llvmIR.CreateXor(children[0], children[1]));

@@ -422,6 +422,32 @@ namespace triton {
   namespace arch {
     namespace x86 {
 
+
+      /* Packed SSE/MMX shift by register/imm count (PSLL*, PSRL*, PSRA*). x86 uses the
+       * whole low 64 bits of the count: count >= lane width zeroes the lane (logical)
+       * or fills it with the sign bit (arithmetic). */
+      static triton::ast::SharedAbstractNode packedShift(const triton::ast::SharedAstContext& ast,
+                                                         const triton::ast::SharedAbstractNode& op1,
+                                                         const triton::ast::SharedAbstractNode& src,
+                                                         triton::uint32 laneBits, int kind /* 0=shl 1=lshr 2=ashr */) {
+        triton::uint32 srcBits = src->getBitvectorSize();
+        auto cnt = srcBits >= 64 ? ast->extract(63, 0, src) : ast->zx(64 - srcBits, src);
+        auto big = ast->bvuge(cnt, ast->bv(laneBits, 64));
+        auto lcnt = laneBits == 64 ? cnt : ast->extract(laneBits - 1, 0, cnt);
+        std::vector<triton::ast::SharedAbstractNode> packed;
+        triton::uint32 bits = op1->getBitvectorSize();
+        for (triton::uint32 hi = bits; hi > 0; hi -= laneBits) {
+          auto lane = ast->extract(hi - 1, hi - laneBits, op1);
+          if (kind == 0)
+            packed.push_back(ast->ite(big, ast->bv(0, laneBits), ast->bvshl(lane, lcnt)));
+          else if (kind == 1)
+            packed.push_back(ast->ite(big, ast->bv(0, laneBits), ast->bvlshr(lane, lcnt)));
+          else
+            packed.push_back(ast->ite(big, ast->bvashr(lane, ast->bv(laneBits - 1, laneBits)), ast->bvashr(lane, lcnt)));
+        }
+        return packed.size() == 1 ? packed[0] : ast->concat(packed);
+      }
+
       x86Semantics::x86Semantics(triton::arch::Architecture* architecture,
                                  triton::engines::symbolic::SymbolicEngine* symbolicEngine,
                                  triton::engines::taint::TaintEngine* taintEngine,
@@ -672,6 +698,7 @@ namespace triton {
           case ID_INS_PREFETCHT1:     this->prefetchx_s(inst);    break;
           case ID_INS_PREFETCHT2:     this->prefetchx_s(inst);    break;
           case ID_INS_PREFETCHW:      this->prefetchx_s(inst);    break;
+          case ID_INS_PSADBW:         this->psadbw_s(inst);       break;
           case ID_INS_PSHUFB:         this->pshufb_s(inst);       break;
           case ID_INS_PSHUFD:         this->pshufd_s(inst);       break;
           case ID_INS_PSHUFHW:        this->pshufhw_s(inst);      break;
@@ -2518,7 +2545,7 @@ namespace triton {
          */
         auto node = this->astCtxt->bv(1, 1);
         for (triton::uint32 counter = 0; counter <= triton::bitsize::byte-1; counter++) {
-          node = this->astCtxt->bvxor(node, this->astCtxt->extract(counter, counter, this->astCtxt->reference(parent)));
+          node = this->astCtxt->bvxor(node, this->astCtxt->extract(low + counter, low + counter, this->astCtxt->reference(parent)));
         }
 
         /* Create the symbolic expression */
@@ -2546,7 +2573,7 @@ namespace triton {
          */
         auto node1 = this->astCtxt->bv(1, 1);
         for (triton::uint32 counter = 0; counter <= triton::bitsize::byte-1; counter++) {
-          node1 = this->astCtxt->bvxor(node1, this->astCtxt->extract(counter, counter, this->astCtxt->reference(parent)));
+          node1 = this->astCtxt->bvxor(node1, this->astCtxt->extract(low + counter, low + counter, this->astCtxt->reference(parent)));
         }
 
         auto node2 = this->astCtxt->ite(
@@ -12862,29 +12889,10 @@ namespace triton {
 
         /* Create symbolic operands */
         auto op1 = this->symbolicEngine->getOperandAst(inst, dst);
-        auto op2 = this->astCtxt->zx(dst.getBitSize() - src.getBitSize(), this->symbolicEngine->getOperandAst(inst, src));
+        auto op2 = this->symbolicEngine->getOperandAst(inst, src);
 
         /* Create the semantics */
-        std::vector<triton::ast::SharedAbstractNode> packed;
-        packed.reserve(4);
-
-        switch (dst.getBitSize()) {
-          /* XMM */
-          case triton::bitsize::dqword:
-            packed.push_back(this->astCtxt->bvshl(this->astCtxt->extract(127, 96, op1), this->astCtxt->extract(31, 0, op2)));
-            packed.push_back(this->astCtxt->bvshl(this->astCtxt->extract( 95, 64, op1), this->astCtxt->extract(31, 0, op2)));
-
-          /* MMX */
-          case triton::bitsize::qword:
-            packed.push_back(this->astCtxt->bvshl(this->astCtxt->extract(63, 32, op1), this->astCtxt->extract(31, 0, op2)));
-            packed.push_back(this->astCtxt->bvshl(this->astCtxt->extract(31,  0, op1), this->astCtxt->extract(31, 0, op2)));
-            break;
-
-          default:
-            throw triton::exceptions::Semantics("x86Semantics::pslld_s(): Invalid operand size.");
-        }
-
-        auto node = this->astCtxt->concat(packed);
+        auto node = packedShift(this->astCtxt, op1, op2, 32, 0);
 
         /* Create symbolic expression */
         auto expr = this->symbolicEngine->createSymbolicExpression(inst, node, dst, "PSLLD operation");
@@ -12940,31 +12948,10 @@ namespace triton {
 
         /* Create symbolic operands */
         auto op1 = this->symbolicEngine->getOperandAst(inst, dst);
-        auto op2 = this->astCtxt->zx(dst.getBitSize() - src.getBitSize(), this->symbolicEngine->getOperandAst(inst, src));
+        auto op2 = this->symbolicEngine->getOperandAst(inst, src);
 
         /* Create the semantics */
-        triton::ast::SharedAbstractNode node;
-
-        std::vector<triton::ast::SharedAbstractNode> packed;
-        packed.reserve(2);
-
-        switch (dst.getBitSize()) {
-          /* XMM */
-          case triton::bitsize::dqword:
-            packed.push_back(this->astCtxt->bvshl(this->astCtxt->extract(127, 64, op1), this->astCtxt->extract(63, 0, op2)));
-            packed.push_back(this->astCtxt->bvshl(this->astCtxt->extract( 63,  0, op1), this->astCtxt->extract(63, 0, op2)));
-            node = this->astCtxt->concat(packed);
-            break;
-
-          /* MMX */
-          case triton::bitsize::qword:
-            /* MMX register is only one QWORD so it's a simple shl */
-            node = this->astCtxt->bvshl(op1, op2);
-            break;
-
-          default:
-            throw triton::exceptions::Semantics("x86Semantics::psllq_s(): Invalid operand size.");
-        }
+        auto node = packedShift(this->astCtxt, op1, op2, 64, 0);
 
         /* Create symbolic expression */
         auto expr = this->symbolicEngine->createSymbolicExpression(inst, node, dst, "PSLLQ operation");
@@ -12988,33 +12975,10 @@ namespace triton {
 
         /* Create symbolic operands */
         auto op1 = this->symbolicEngine->getOperandAst(inst, dst);
-        auto op2 = this->astCtxt->zx(dst.getBitSize() - src.getBitSize(), this->symbolicEngine->getOperandAst(inst, src));
+        auto op2 = this->symbolicEngine->getOperandAst(inst, src);
 
         /* Create the semantics */
-        std::vector<triton::ast::SharedAbstractNode> packed;
-        packed.reserve(8);
-
-        switch (dst.getBitSize()) {
-          /* XMM */
-          case triton::bitsize::dqword:
-            packed.push_back(this->astCtxt->bvshl(this->astCtxt->extract(127, 112, op1), this->astCtxt->extract(15, 0, op2)));
-            packed.push_back(this->astCtxt->bvshl(this->astCtxt->extract(111,  96, op1), this->astCtxt->extract(15, 0, op2)));
-            packed.push_back(this->astCtxt->bvshl(this->astCtxt->extract( 95,  80, op1), this->astCtxt->extract(15, 0, op2)));
-            packed.push_back(this->astCtxt->bvshl(this->astCtxt->extract( 79,  64, op1), this->astCtxt->extract(15, 0, op2)));
-
-          /* MMX */
-          case triton::bitsize::qword:
-            packed.push_back(this->astCtxt->bvshl(this->astCtxt->extract(63, 48, op1), this->astCtxt->extract(15, 0, op2)));
-            packed.push_back(this->astCtxt->bvshl(this->astCtxt->extract(47, 32, op1), this->astCtxt->extract(15, 0, op2)));
-            packed.push_back(this->astCtxt->bvshl(this->astCtxt->extract(31, 16, op1), this->astCtxt->extract(15, 0, op2)));
-            packed.push_back(this->astCtxt->bvshl(this->astCtxt->extract(15,  0, op1), this->astCtxt->extract(15, 0, op2)));
-            break;
-
-          default:
-            throw triton::exceptions::Semantics("x86Semantics::psllw_s(): Invalid operand size.");
-        }
-
-        auto node = this->astCtxt->concat(packed);
+        auto node = packedShift(this->astCtxt, op1, op2, 16, 0);
 
         /* Create symbolic expression */
         auto expr = this->symbolicEngine->createSymbolicExpression(inst, node, dst, "PSLLW operation");
@@ -13041,28 +13005,7 @@ namespace triton {
         auto op2 = this->symbolicEngine->getOperandAst(inst, src);
 
         /* Create the semantics */
-        std::vector<triton::ast::SharedAbstractNode> pck;
-        pck.reserve(dst.getSize() / triton::size::dword);
-
-        auto shift = this->astCtxt->ite(
-          this->astCtxt->bvuge(op2, this->astCtxt->bv(triton::bitsize::dword, src.getBitSize())),
-          this->astCtxt->bv(triton::bitsize::dword, src.getBitSize()),
-          op2
-        );
-
-        if (shift->getBitvectorSize() < triton::bitsize::dword) {
-          shift = this->astCtxt->zx(triton::bitsize::dword - shift->getBitvectorSize(), shift);
-        }
-        else {
-          shift = this->astCtxt->extract(triton::bitsize::dword - 1, 0, shift);
-        }
-
-        for (triton::uint32 i = 0; i < dst.getSize() / triton::size::dword; ++i) {
-          uint32 high = (dst.getBitSize() - 1) - (i * triton::bitsize::dword);
-          uint32 low = (dst.getBitSize() - triton::bitsize::dword) - (i * triton::bitsize::dword);
-          pck.push_back(this->astCtxt->bvashr(this->astCtxt->extract(high, low, op1), shift));
-        }
-        auto node = this->astCtxt->concat(pck);
+        auto node = packedShift(this->astCtxt, op1, op2, 32, 2);
 
         /* Create symbolic expression */
         auto expr = this->symbolicEngine->createSymbolicExpression(inst, node, dst, "PSRAD operation");
@@ -13084,28 +13027,7 @@ namespace triton {
         auto op2 = this->symbolicEngine->getOperandAst(inst, src);
 
         /* Create the semantics */
-        std::vector<triton::ast::SharedAbstractNode> pck;
-        pck.reserve(dst.getSize() / triton::size::word);
-
-        auto shift = this->astCtxt->ite(
-          this->astCtxt->bvuge(op2, this->astCtxt->bv(triton::bitsize::word, src.getBitSize())),
-          this->astCtxt->bv(triton::bitsize::word, src.getBitSize()),
-          op2
-        );
-
-        if (shift->getBitvectorSize() < triton::bitsize::word) {
-          shift = this->astCtxt->zx(triton::bitsize::word - shift->getBitvectorSize(), shift);
-        }
-        else {
-          shift = this->astCtxt->extract(triton::bitsize::word - 1, 0, shift);
-        }
-
-        for (triton::uint32 i = 0; i < dst.getSize() / triton::size::word; ++i) {
-          uint32 high = (dst.getBitSize() - 1) - (i * triton::bitsize::word);
-          uint32 low = (dst.getBitSize() - triton::bitsize::word) - (i * triton::bitsize::word);
-          pck.push_back(this->astCtxt->bvashr(this->astCtxt->extract(high, low, op1), shift));
-        }
-        auto node = this->astCtxt->concat(pck);
+        auto node = packedShift(this->astCtxt, op1, op2, 16, 2);
 
         /* Create symbolic expression */
         auto expr = this->symbolicEngine->createSymbolicExpression(inst, node, dst, "PSRAW operation");
@@ -13124,29 +13046,10 @@ namespace triton {
 
         /* Create symbolic operands */
         auto op1 = this->symbolicEngine->getOperandAst(inst, dst);
-        auto op2 = this->astCtxt->zx(dst.getBitSize() - src.getBitSize(), this->symbolicEngine->getOperandAst(inst, src));
+        auto op2 = this->symbolicEngine->getOperandAst(inst, src);
 
         /* Create the semantics */
-        std::vector<triton::ast::SharedAbstractNode> packed;
-        packed.reserve(4);
-
-        switch (dst.getBitSize()) {
-          /* XMM */
-          case triton::bitsize::dqword:
-            packed.push_back(this->astCtxt->bvlshr(this->astCtxt->extract(127, 96, op1), this->astCtxt->extract(31, 0, op2)));
-            packed.push_back(this->astCtxt->bvlshr(this->astCtxt->extract( 95, 64, op1), this->astCtxt->extract(31, 0, op2)));
-
-          /* MMX */
-          case triton::bitsize::qword:
-            packed.push_back(this->astCtxt->bvlshr(this->astCtxt->extract(63, 32, op1), this->astCtxt->extract(31, 0, op2)));
-            packed.push_back(this->astCtxt->bvlshr(this->astCtxt->extract(31,  0, op1), this->astCtxt->extract(31, 0, op2)));
-            break;
-
-          default:
-            throw triton::exceptions::Semantics("x86Semantics::psrld_s(): Invalid operand size.");
-        }
-
-        auto node = this->astCtxt->concat(packed);
+        auto node = packedShift(this->astCtxt, op1, op2, 32, 1);
 
         /* Create symbolic expression */
         auto expr = this->symbolicEngine->createSymbolicExpression(inst, node, dst, "PSRLD operation");
@@ -13202,31 +13105,10 @@ namespace triton {
 
         /* Create symbolic operands */
         auto op1 = this->symbolicEngine->getOperandAst(inst, dst);
-        auto op2 = this->astCtxt->zx(dst.getBitSize() - src.getBitSize(), this->symbolicEngine->getOperandAst(inst, src));
+        auto op2 = this->symbolicEngine->getOperandAst(inst, src);
 
         /* Create the semantics */
-        triton::ast::SharedAbstractNode node;
-
-        std::vector<triton::ast::SharedAbstractNode> packed;
-        packed.reserve(2);
-
-        switch (dst.getBitSize()) {
-          /* XMM */
-          case triton::bitsize::dqword:
-            packed.push_back(this->astCtxt->bvlshr(this->astCtxt->extract(127, 64, op1), this->astCtxt->extract(63, 0, op2)));
-            packed.push_back(this->astCtxt->bvlshr(this->astCtxt->extract( 63,  0, op1), this->astCtxt->extract(63, 0, op2)));
-            node = this->astCtxt->concat(packed);
-            break;
-
-          /* MMX */
-          case triton::bitsize::qword:
-            /* MMX register is only one QWORD so it's a simple shr */
-            node = this->astCtxt->bvlshr(op1, op2);
-            break;
-
-          default:
-            throw triton::exceptions::Semantics("x86Semantics::psrlq_s(): Invalid operand size.");
-        }
+        auto node = packedShift(this->astCtxt, op1, op2, 64, 1);
 
         /* Create symbolic expression */
         auto expr = this->symbolicEngine->createSymbolicExpression(inst, node, dst, "PSRLQ operation");
@@ -13250,36 +13132,80 @@ namespace triton {
 
         /* Create symbolic operands */
         auto op1 = this->symbolicEngine->getOperandAst(inst, dst);
-        auto op2 = this->astCtxt->zx(dst.getBitSize() - src.getBitSize(), this->symbolicEngine->getOperandAst(inst, src));
+        auto op2 = this->symbolicEngine->getOperandAst(inst, src);
 
         /* Create the semantics */
-        std::vector<triton::ast::SharedAbstractNode> packed;
-        packed.reserve(8);
-
-        switch (dst.getBitSize()) {
-          /* XMM */
-          case triton::bitsize::dqword:
-            packed.push_back(this->astCtxt->bvlshr(this->astCtxt->extract(127, 112, op1), this->astCtxt->extract(15, 0, op2)));
-            packed.push_back(this->astCtxt->bvlshr(this->astCtxt->extract(111,  96, op1), this->astCtxt->extract(15, 0, op2)));
-            packed.push_back(this->astCtxt->bvlshr(this->astCtxt->extract( 95,  80, op1), this->astCtxt->extract(15, 0, op2)));
-            packed.push_back(this->astCtxt->bvlshr(this->astCtxt->extract( 79,  64, op1), this->astCtxt->extract(15, 0, op2)));
-
-          /* MMX */
-          case triton::bitsize::qword:
-            packed.push_back(this->astCtxt->bvlshr(this->astCtxt->extract(63, 48, op1), this->astCtxt->extract(15, 0, op2)));
-            packed.push_back(this->astCtxt->bvlshr(this->astCtxt->extract(47, 32, op1), this->astCtxt->extract(15, 0, op2)));
-            packed.push_back(this->astCtxt->bvlshr(this->astCtxt->extract(31, 16, op1), this->astCtxt->extract(15, 0, op2)));
-            packed.push_back(this->astCtxt->bvlshr(this->astCtxt->extract(15,  0, op1), this->astCtxt->extract(15, 0, op2)));
-            break;
-
-          default:
-            throw triton::exceptions::Semantics("x86Semantics::psrlw_s(): Invalid operand size.");
-        }
-
-        auto node = this->astCtxt->concat(packed);
+        auto node = packedShift(this->astCtxt, op1, op2, 16, 1);
 
         /* Create symbolic expression */
         auto expr = this->symbolicEngine->createSymbolicExpression(inst, node, dst, "PSRLW operation");
+
+        /* Update the x87 FPU Tag Word */
+        if (dst.getBitSize() == triton::bitsize::qword) {
+          this->updateFTW(inst, expr);
+        }
+
+        /* Spread taint */
+        expr->isTainted = this->taintEngine->taintUnion(dst, src);
+
+        /* Update the symbolic control flow */
+        this->controlFlow_s(inst);
+      }
+
+
+      void x86Semantics::psadbw_s(triton::arch::Instruction& inst) {
+        auto& dst = inst.operands[0];
+        auto& src = inst.operands[1];
+
+        /* Create symbolic operands */
+        auto op1 = this->symbolicEngine->getOperandAst(inst, dst);
+        auto op2 = this->symbolicEngine->getOperandAst(inst, src);
+
+        /* |a - b| for two unsigned bytes, computed in 16 bits (max diff 255). */
+        auto absdiff = [this](const triton::ast::SharedAbstractNode& a,
+                              const triton::ast::SharedAbstractNode& b) {
+          auto za = this->astCtxt->zx(8, a);   /* 8 -> 16 bits */
+          auto zb = this->astCtxt->zx(8, b);
+          return this->astCtxt->ite(this->astCtxt->bvuge(za, zb),
+                                    this->astCtxt->bvsub(za, zb),
+                                    this->astCtxt->bvsub(zb, za));
+        };
+
+        /* Sum of the 8 abs byte-diffs in the 64-bit lane whose top bit is `top`. */
+        auto laneSum = [this, &op1, &op2, &absdiff](triton::uint32 top) {
+          triton::ast::SharedAbstractNode sum;
+          for (triton::uint32 i = 0; i < 8; ++i) {
+            triton::uint32 hi = top - i * 8;
+            auto d = absdiff(this->astCtxt->extract(hi, hi - 7, op1),
+                             this->astCtxt->extract(hi, hi - 7, op2));
+            sum = (i == 0) ? d : this->astCtxt->bvadd(sum, d);
+          }
+          return sum;   /* 16-bit */
+        };
+
+        /* Each lane result: sum in bits [15:0], the rest of the 64-bit lane zeroed. */
+        triton::ast::SharedAbstractNode node;
+        switch (dst.getBitSize()) {
+
+          /* XMM: bytes 0-7 -> qword 0, bytes 8-15 -> qword 1 */
+          case triton::bitsize::dqword: {
+            auto lo = this->astCtxt->zx(48, laneSum(63));
+            auto hi = this->astCtxt->zx(48, laneSum(127));
+            node = this->astCtxt->concat(std::vector<triton::ast::SharedAbstractNode>{hi, lo});
+            break;
+          }
+
+          /* MMX: 8 bytes -> one qword */
+          case triton::bitsize::qword:
+            node = this->astCtxt->zx(48, laneSum(63));
+            break;
+
+          default:
+            throw triton::exceptions::Semantics("x86Semantics::psadbw_s(): Invalid operand size.");
+        }
+
+        /* Create symbolic expression */
+        auto expr = this->symbolicEngine->createSymbolicExpression(inst, node, dst, "PSADBW operation");
 
         /* Update the x87 FPU Tag Word */
         if (dst.getBitSize() == triton::bitsize::qword) {
@@ -14609,7 +14535,7 @@ namespace triton {
         expr->isTainted = this->taintEngine->taintUnion(dst, src);
 
         /* Update symbolic flags */
-        this->cfRor_s(inst, expr, dst, op2);
+        this->cfRor_s(inst, expr, dst, op2bis);   // masked count: ror by a multiple of width still sets CF
         this->ofRor_s(inst, expr, dst, op2bis);
 
         /* Tag undefined flags */

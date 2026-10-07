@@ -1103,6 +1103,9 @@ namespace triton {
           //! The PREFETCHx semantics.
           void prefetchx_s(triton::arch::Instruction& inst);
 
+          //! The PSADBW semantics.
+          void psadbw_s(triton::arch::Instruction& inst);
+
           //! The PSHUFB semantics.
           void pshufb_s(triton::arch::Instruction& inst);
 
