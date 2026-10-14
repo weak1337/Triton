@@ -1057,6 +1057,15 @@ namespace triton {
 
       //! Update the FPU x87 Tag Word (whenever an STX register changes)
       void x86Semantics::updateFTW(triton::arch::Instruction& inst, const triton::engines::symbolic::SharedSymbolicExpression& parent) {
+        // SSE packed instructions share handlers with MMX but do not touch x87.
+        bool touchesX87 = false;
+        for (const auto& operand : inst.operands) {
+          if (operand.getType() != OP_REG) continue;
+          auto id = operand.getConstRegister().getParent();
+          if (id >= ID_REG_X86_ST0 && id <= ID_REG_X86_ST7) touchesX87 = true;
+        }
+        if (!touchesX87) return;
+
         /* Fetch the STX registers */
         auto st0 = triton::arch::OperandWrapper(this->architecture->getRegister(ID_REG_X86_ST0));
         auto st1 = triton::arch::OperandWrapper(this->architecture->getRegister(ID_REG_X86_ST1));
@@ -14178,7 +14187,9 @@ namespace triton {
         auto expr = this->symbolicEngine->createSymbolicExpression(inst, node, dst, "PXOR operation");
 
         /* Update the x87 FPU Tag Word */
-        this->updateFTW(inst, expr);
+        if (dst.getBitSize() == triton::bitsize::qword) {
+          this->updateFTW(inst, expr);
+        }
 
         /* Spread taint */
         if (dst.getType() == OP_REG && src.getRegister() == dst.getRegister())
@@ -14201,6 +14212,9 @@ namespace triton {
         auto op2    = this->symbolicEngine->getOperandAst(inst, src);
         auto op2bis = this->symbolicEngine->getOperandAst(src);
         auto op3    = this->symbolicEngine->getOperandAst(inst, srcCf);
+
+        const auto maskedCount = op2->evaluate() &
+          (dst.getBitSize() == triton::bitsize::qword ? 0x3fu : 0x1fu);
 
         switch (dst.getBitSize()) {
           /* Mask: 0x1f without MOD */
@@ -14261,7 +14275,7 @@ namespace triton {
         this->ofRol_s(inst, expr2, dst, op2bis); /* Same as ROL */
 
         /* Tag undefined flags */
-        if (op2->evaluate() > 1) {
+        if (maskedCount > 1) {
           this->undefined_s(inst, this->architecture->getRegister(ID_REG_X86_OF));
         }
 
@@ -14279,6 +14293,9 @@ namespace triton {
         auto op1    = this->symbolicEngine->getOperandAst(inst, dst);
         auto op2    = this->symbolicEngine->getOperandAst(inst, src);
         auto op3    = this->symbolicEngine->getOperandAst(inst, srcCf);
+
+        const auto maskedCount = op2->evaluate() &
+          (dst.getBitSize() == triton::bitsize::qword ? 0x3fu : 0x1fu);
 
         switch (dst.getBitSize()) {
           /* Mask: 0x3f without MOD */
@@ -14339,7 +14356,7 @@ namespace triton {
         this->cfRcr_s(inst, expr2, dst, node1, op2);
 
         /* Tag undefined flags */
-        if (op2->evaluate() > 1) {
+        if (maskedCount > 1) {
           this->undefined_s(inst, this->architecture->getRegister(ID_REG_X86_OF));
         }
 
@@ -14413,6 +14430,9 @@ namespace triton {
         auto op2    = this->symbolicEngine->getOperandAst(inst, src);
         auto op2bis = this->symbolicEngine->getOperandAst(src);
 
+        const auto maskedCount = op2->evaluate() &
+          (dst.getBitSize() == triton::bitsize::qword ? 0x3fu : 0x1fu);
+
         switch (dst.getBitSize()) {
           /* Mask 0x3f MOD size */
           case triton::bitsize::qword:
@@ -14467,7 +14487,7 @@ namespace triton {
         this->ofRol_s(inst, expr, dst, op2bis);
 
         /* Tag undefined flags */
-        if (op2->evaluate() > 1) {
+        if (maskedCount > 1) {
           this->undefined_s(inst, this->architecture->getRegister(ID_REG_X86_OF));
         }
 
@@ -14484,6 +14504,9 @@ namespace triton {
         auto op1    = this->symbolicEngine->getOperandAst(inst, dst);
         auto op2    = this->symbolicEngine->getOperandAst(inst, src);
         auto op2bis = this->symbolicEngine->getOperandAst(src);
+
+        const auto maskedCount = op2->evaluate() &
+          (dst.getBitSize() == triton::bitsize::qword ? 0x3fu : 0x1fu);
 
         switch (dst.getBitSize()) {
           /* Mask 0x3f MOD size */
@@ -14539,7 +14562,7 @@ namespace triton {
         this->ofRor_s(inst, expr, dst, op2bis);
 
         /* Tag undefined flags */
-        if (op2->evaluate() > 1) {
+        if (maskedCount > 1) {
           this->undefined_s(inst, this->architecture->getRegister(ID_REG_X86_OF));
         }
 
